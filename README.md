@@ -4,110 +4,171 @@ _Evaluate your product, not your tests. Write lovely little Scenes for your Acto
 
 ---
 
-Scenetest began from the idea that end-to-end testing kind of seemds to be describing two things:
+## Concept
 
-1. Start to finish: Test a set of user interactions from start to finish (we call these _Scenes_)
-2. Front to back: Make assertions from client to DB and back again; compare what you find across
-  different contexts (on the screen, in the database, in localStorage)
+Scenetest began from picking at the idea that end-to-end testing kind of seems to be confusing two very different and important things:
 
-We use Playwright in our work because it allows us to do both of these things. It treats your spec files like writing a scene in a play, using `page.click('#my-button')` style interactions to drive the script forward. This is really nice! And it allows you to use the nodejs / superuser context to check information in the database directly, while you check what you see on the screen to make sure your expectations match, which gives us testing from start to finish and front to back.
+1. Client to Server (CtS): Compare data across different contexts to ensure that what you find in your database matches what shows up on screen, as well as in your browser cache, localStorage, or any other context.
+2. Start to Finish (StF): Test a set of user interactions from beginning to end so we can codify key user journeys and flows, edge cases and strange user inputs, and make sure they still work as code changes.
 
-But having these evaluations live side by side with browser orchestration is confusing, and in today's increasingly local-first development practices, you increasingly need to examine not only text on the screen but also the contents of the browser cache or localStorage. In Playwright you
-would use `const someClientData = page.evaluate((data) => clientDataFn, dataFromServer)` to get data out of the browser and into the test context where you can run your evaluation. But if you want your evaluation to use data accessible from inside a react context or a dynamically created store or queryClient, you have to jump through a lot of hoops to make that work.
+Often times, when you ask someone to define End-to-End testing they will say "testing a workflow from start to finish," and then if you pause and give them time to speak, they will end up adding in something about "comparing the database to the browser". But conceptually these two are _very different_, so we won't be using the term E2E here, we have invented our own little terms called Client to Server and Start to Finish, which we will abbreviate here as CtS and StF.
 
-While searching for alternatives that would allow us to get around this last limitation, we of course checked out Vitest's In-Source testing, but found that in-source is not the same as in-scope. You may colocate your evaluations with your code, but it doesn't run in the application context.
+## Starting Point
 
-So these are the two core concerns that Scenetest addresses:
+We use Playwright in our work because it allows us to test Client-to-Server and Start-to-Finish. We can test what's on the page with `page.locator`, drive interactions forward with `page.click('#my-button')`-style interactions, and then run queries in our superuser context to ensure the database matches with our expectations. This is really nice!
 
-1. Keep your spec files nice and clean: just write lovely little scripts for your automated actors to simulate user interactions.
-2. Define your expectations in the same code you're evaluating (where they are much easier to read, and can double as documentation of your code)
-3. Call your expectations in the same Javascript scope
-Colocate your expectations with the code they're evaluating, and call them from in the same scope: Instead of the test context calling `page.evaluate((data) => fn, data)`, the application context defines expectations which call `scenetest((server, data) => fn, data)` when they need to access the data as a superuser or service role.
+But having these evaluations live side by side with browser orchestration is confusing, and in today's increasingly local-first meta, you often need to examine not only text on the screen but also the contents of the browser cache or localStorage. So it's not enough to just check that the database has a record and the screen has my new username on it, we want to look into our local pgLite or localDb or our tanstack/db collections and check that the data is there. What now?
 
-So your Scene orchestrates the actions, and your in-app expectations run as a consequence of this; they're not defined in the spec, they just run when the app runs in test mode. One benefit of this is you can fire up the app in test mode and use it yourself! So all the assertions are still running while you improv your own scene. Here's an example component using in-app expectations; no spec files, completely un-concerned with which tests are using it:
+In Playwright you would use `page.evaluate`, a statement defined in the test file, to execute a function in the global browser context and exfiltrate the data back out to the test app. Sometimes this is nice and easy, but just getting data out of a statically defined collection can get messy fast. (Let alone a React hook or component props -- don't even get me started!) Here's an example form my language-learning app where users have flash card decks for different languages:
 
 ```javascript
-// ~components/profile-form.ts
-import { scenetest, expect, failure } from 'scenetest'
-import { useStore } from 'zustand'
-import { useForm } from '@your-fave/form'
-import { useStore } from 'zustand'
-import { updateProfile } from '~lib/my-api'
-import { store } from '~lib/my-store'
+import { test, expect } from 'playwright'
+import { getDeck } from '~test/db-helpers'
 
-export function ProfileForm() {
-	const profile = useStore(store, data => data.profile)
-	expect('ProfileForm only renders when profile available first-tick', !!profile)
+const TEST_USER_ID = '1'
+const TEST_LANG = 'spa'
 
-	const form = useForm({
-		onSubmit: updateProfile,
-		onSuccess: (data, inputs) => {
-			const newProfile = ProfileSchema.parse(data)
-			store.updateProfile(newProfile)
-			toast.show('Updated successfully!')
-		},
-		onError: toast.error('Update failed :(')
-		onSettled: {
-			scenetest({
-				title: 'Updating profile'
-				// the expectFn provides a "server" object that you configure (see below)
-				expectFn: async (server, fromApp) => {
-					// wait for the toast before checking everything else
-					await expect('shows success toast', /* ... */)
+test.describe.serial('Create a deck and modify it a few different ways', () => {
+	test('1. useNewDeckMutation: create new deck', async ({ page }) => {
+		// .. orchestration code to log in & navigate to the add-a-deck page
+		// .. orchestration code to create a new deck
 
-					const dbProfile = await server.getProfile(fromApp.userId)
-					expect('has DB updated_at value in the last 10 seconds', /* ... */)
-					expect('has DB values same as form inputs', /* ... */)
+		// test that the deck was created in the database
+		const deckInDatabase = await getDeck(TEST_USER_ID, TEST_LANG)
+		expect(deckInDatabase).toBeTruthy()
+		expect(deckInDatabase?.lang).toBe(TEST_LANG)
+		expect(deckInDatabase?.uid).toBe(TEST_USER_UID)
 
-					// some values may not match the DB exactly, b/c serialisation etc.
-					// but the developer felt like these fields definitely should match
-					const fieldsToCompare = [
-						'username', 'uid', 'language', 'avatar_url', 'bio', 'updated_at',
-					]
-					expect('has same values in DB & local collection', () => {
-						for(key in fieldsToCompare) {
-							if (dbProfile[key] !== fromApp.localDbData[key])
-								// failure doesn't end the test; it just records a failure
-								failure(`Values for "${key}" do not match`)
-						}
-					})
-				},
-				appDataFn: () => ({
-					userId,
-					formSuccessData: newProfile,
-					localDbData: store.getProfile(),
-					formInputs: inputs,
-					// profile,
-				}),
-				// to test reactivity for a `profile = useProfile()` hook, we might add a tiny delay
-				// delay: 50,
-			})
-		}
+		// test that the deck was inserted into local collection
+		const deckInCollection = await page.evaluate((lang) => {
+			const collection = window.__decksCollection
+			return collection?.get(lang)
+		}, TEST_LANG)
+		expect(deckInCollection).toBeTruthy()
+		expect(deckInCollection?.lang).toBe(TEST_LANG)
+		expect(deckInCollection?.uid).toBe(TEST_USER_UID)
+
+		// test that the two are the similar enough
+		expect(deckInDatabase?.deck_id).toBe(deckInCollection?.deck_id)
+		expect(deckInDatabase?.updated_at).toBe(deckInCollection?.updated_at)
 	})
-	// if (!profile) return <>Loading...</>
-	return <UpdateProfileForm form={form} initialData={profile} />
+	// .. additional tests to perform other actions and check them
+})
+```
+
+This works, and it gets us to the goal -- multi-context assertions that compare data from Client to Server. But notice the ugly `window.__decksCollection` -- I had to go into my application code and attach the decksCollection to the window just to expose it to the global context in which these `page.evaluate` functions will run. That is... a problem.
+
+And if I wanted to return the data that the actual app is using, say from some line in my component like `const allMyDecks = useDecks()`, I absolutely cannot do it. The closest I can get is I can wire up a bunch of tooling to run this `useDecks()` hook in my evaluation function, but it will not be the same exact result as the one used in the component because I have no way of triggering the evaluation to run using the exact value that I'm expecting in my component code at the exact moment it expects it use it.
+
+And, having looked into these solutions, I can only say the level of boilerplate and tooling you have to do, and the amount of code you have to reproduce _inside your specs_ is so much that it feels like you are building test code that's more complex than the feature itself, at which point you're just testing your tests.
+
+While searching for alternatives that would allow us to get around these limitations, we of course checked out Vitest's In-Source testing, but found that in-source is not the same as in-app and definitely not the same as _in-scope_. You may colocate your evaluations with your code, but it doesn't run in the application context. Their approach lets you run tests in the same _closure_, which is a start, but look at their example:
+
+```javascript
+// the implementation
+export function add(...args: number[]) {
+  return args.reduce((a, b) => a + b, 0)
+}
+
+// in-source test suites
+if (import.meta.vitest) {
+  const { it, expect } = import.meta.vitest
+  it('add', () => {
+    expect(add()).toBe(0)
+    expect(add(1)).toBe(1)
+    expect(add(1, 2, 3)).toBe(6)
+  })
 }
 ```
 
-There's a lot to notice about this example, so let's unpack it a bit.
-
-First, please notice the logical flow of this process:
-
-1. We decide that at a certain part in the application code, we want to test some things that just happened -- we just concluded a mutation, this is maybe the best example of when you want your mutation to run front-to-back, app-to-server and back again. So we declare the `scenetest()` to run on the `onSettled` callback for our form.
-2. the `scenetest` config object accepts an `expectFn` which runs in nodejs and an `appDataFn` which runs on the client, evaluates the function, and passes the data to the server for evaluation. This is like Playwright's `page.evaluate` but in reverse.
-3. Because of this, we're able to execute `appDataFn` not only colocated with the code its testing, but in the same javascript scope, able to evaluate the store's `getProfile` in the very same tick in the react/javascript lifecycle.
-4. We're also able to access the form inputs and `profile` variable directly -- not just the ones we hardcoded into the spec file as `PROFILE_1_UPDATE_PROFILE_OLD_USERNAME` and `PROFILE_1_UPDATE_PROFILE_NEW_USERNAME`, but the profile returned from the hook and the inputs passed to the form.
-
-We're moving a lot of the testing logic into the component, and that's on purpose. And because all the necessary expectations and optional delay and retries would be handled in this code, our orchestration code, our spec files where we define our Scene is going to be much simpler.
+First off, we should say that Vitest is for more granular unit-testing and this is not a knock against them at all. This in-source testing gets us one step closer to some better ergonomics for unit testing your logic, but imagine an approach to declaring tests that looked more like this:
 
 ```javascript
-// ~tests/scenes/profile.spec.ts
-import { test, goal, warn } from 'scenetest'
+
+export function add(...args: number[]) {
+  // in-scope test
+  hypotheticalTest(() => {
+    for(num in args) {
+      if (typeof num !== 'number')
+        raiseFailure('Oops! Your typescript checks have not prevented you from'
+        + ' passing a non-number to the `add` function which only wants numbers')
+    }
+  })
+
+  // application code
+  return args.reduce((a, b) => a + b, 0)
+}
+
+```
+
+Now we are testing something very different. This is not end-to-end in the sense of the StF user journey, but starting to scratch at the surface of the core concept behind why the client-to-server testing is relevant and so important. I mean think about it -- why does end-to-end care about the server, if it's only concerned with the user journey? Why do I care whether the `updated_at` field will be different after making a change, if the user never sees it? Why do we care about database persistence if we can orchestrate our script to simply refresh the page and find the new value is there?
+
+We care because what we're validating with client-to-server tests is not the _user journey_ here but the _developers' mental model_ for how the system functions. We are validating implementation details and side effects and triggers and **affirming that the system works the way we think it works**.
+
+## Core Considerations
+
+1. Spec files should be nice and clean -- we are just orchestrating user interactions with the product, so they can be written without full knowledge of how the system works, just testing the start-to-finish of the thing.
+2. Multi-context assertions and evaluations are able to run fully client-to-server, so we can compare expectations not just from the screen but from other places like a localDb, a KV-store, etc.
+3. Test your product, not your tests. Evaluations and assertions should compare data gathered from/called by the same functions and in the same contexts as the code they're evaluating. Otherwise, all that duplicated logic in your spec files is not just adding work, but it's detracting from the applicability of your test suite.
+4. Evaluations live in application code so that whenever you're in test mode, they run every time any agent uses the app, whether it's a human being or an orchestrated/simulated actor managed by the test script.
+
+## Show Me Some Code!
+
+Fine. Here!
+
+### In-Scope Test Assertions
+
+```javascript
+import { useProfile } from '~lib/hooks'
+import { pass } from 'scenetest'
+
+export function ProfileForm() {
+  const { data: profile } = useProfile()
+  pass(
+    'Profile should be available (or null) from the first tick (no "pending" state)',
+    profile !== undefined
+	)
+
+  if (!profile) return <CreateProfileForm />
+  return <EditProfileForm initialData={profile} />
+}
+
+```
+
+**This is a test of our mental model for how the code works.** It mimics how you might write a comment in the code, except you've formalised it as a test that will run every time any part of your orchestration suite hits this component. This leads us to our first two major benefits:
+
+> **1. We re-use testing logic by colocating it with the very same React code we are testing**
+>
+> You can write 15 different test scenes and whenever they hit this code, they'll run through the same assertions.
+
+> **2. Our evaluation uses data from useProfile at the exact same tick in the React lifecycle as our component**
+>
+> We don't have to do anything to "simulate" the useProfile hook in our testing scripts/specs/scenes, we get to use the same data the component uses, at the same moment that we decide it is meant to be there.
+
+Because the assertions are decoupled from the orchestration scripts, they'll run (and report results) regardless of whether the page is being used by the test-runner UserAgent, or if it's just you, our beloved developer (and target audience), trying to fix this form and visiting `localhost:5173/profile` to see that it looks right.
+
+The `pass` function is stripped out by our Vite plugin so it never runs in production, but when you run in dev or test mode, it will evaluate every time this component renders and report results to the test suite. Having decoupled _Scene flow_ from _Assertion logic_ leads us to the next two really interesting benefits of this approach:
+
+> **3. You can improv your own test scenes without ever writing a "spec", just _use the product_**
+>
+> **4. The person who writes the test scene doesn't have to know how the app works under the hood**
+>
+> Your PM or a QA manager can freestyle clicking through the app, inputting whatever garbage edge-case user inputs they want, and all your assertions will run in the background and report to the test suite. Writing test scenes doesn't require understanding the intermediate steps, side effects and implementation details of how the app functions under the hood.
+
+This speaks to one of our biggest concerns with modern test tooling: Test your product, not your tests. Too often tests pass or fail because of implementation details _of the test_. In many cases, confidence in the test suite degrades over time because you have passing tests but a broken product, or failing tests but a working product, and minimising this specific pitfall is one of the primary goals of Scenetest.
+
+### Writing Scenes to Test
+
+So far we've discussed the in-scope, in-app, in-component assertions, but not the scene orchestration that is essential for doing Start-to-Finish tests. Imagine you have written your assertions in the component already, and now it's time to write a scene where a fake user logs in and attempts to edit their username:
+
+```javascript
+// ~tests/scenes/edit-profile.spec.ts
+import { scene, pass, warn } from 'scenetest'
 import { actor1 } from '~tests/actors'
 import { setupProfile, getProfile, teardownProfile } from '~tests/utils'
 import { loginUser, navigateToOwnProfile, successToast } from '~tests/navigations'
 
-test.scene({
+scene({
 	title: 'The user updates their username and finds it has updated on the page',
 	prepareScene: () => setupProfile(actor1.profile),
 	cleanupScene: () => teardownProfile(actor1.uid),
@@ -127,11 +188,11 @@ test.scene({
 		await form.submit()
 
 		const newNameInDb = await getProfile(actor1.uid)
-		const newNameOnScreen = form.$(`input[name=username]`).text()
+		const newNameOnScreen = form.$(`h3#username`).text()
 
-		// we are only testing final outcomes
-		goal(`Username updated successfully in database`, newUsername === newNameInDb)
-		goal(`Username updated successfully on screen`, newUsername === newNameOnScreen)
+		// testing only outcomes; no side effects or implementation details
+		pass(`Username updated successfully in database`, newUsername === newNameInDb)
+		pass(`Username updated successfully on screen`, newUsername === newNameOnScreen)
 		if (newUsername !== newNameOnScreen) {
 			if (newUsername !== newNameInDb) fail('Username failed to update')
 			else fail('Username updated in DB but not on screen')
@@ -140,114 +201,135 @@ test.scene({
 })
 ```
 
-Here we are, just writing a lovely little script, what the user does and what the user gets.
+This code should look strikingly similar to a Playwright spec. And it would work just fine as one. It will fail if you're unable to navigate or log in, if after logging in you're not able to see the username input, if the database entry doesn't match the new username value, or if the screen doesn't update to show the new username.
 
-You might notice there's no asserting happening until the very end. That's because we've separated
-the front-to-back evaluations into the in-scope tests above, and here we only need to concern
-ourselves with the navigation through the user journey from start to finish. In fact, even the
-goal and fail at the end feels out of place.
+But imagine a situation where the profile is being stored in a collection, cache or store that doesn't update properly, and the username's `h3` element is written as `<h3>{mutation.data?.username ?? profile.username }</h3>`. In this scenario, the test would pass because the mutation data contains the new username, but if the profile page unmounts and remounts, the old value will still show until we refresh the page, refetch the queries, and rebuild the local cache. This is exactly, _exactly_ the kind of thing we need tests for, and exactly the kind of thing that is so difficult to do with mainstream test tooling.
 
-What if we changed it a little to look like this...
+### Client-to-Server In-Scope Tests
+
+Here's our profile form, with assertions that will test every key feature of our mental model for how the form works:
 
 ```javascript
-// ~tests/scenes/profile.spec.ts
-// .. same imports
+// ~components/profile-form.ts
+import { assertion, pass, fail } from 'scenetest'
+import { useForm } from '@your-fave/form'
+import { useStore } from 'zustand'
+import { toast } from 'your-fave-toast'
+import { updateProfile } from '~lib/my-api'
+import { store } from '~lib/my-store'
 
-test.scene({
-	// ..
+export function UpdateProfileForm() {
+	const profile = useStore(store, data => data.profile)
+	fail('ProfileForm rendered before profile is available', !profile)
+
+	const myForm = useForm({
+		onSubmit: updateProfile,
+		onSuccess: (data, inputs) => {
+			const newProfile = ProfileSchema.parse(data)
+			store.updateProfile(newProfile)
+			toast.show('Updated successfully!')
+		},
+		onError: () => toast.error('Update failed :('),
+		onSettled: {
+			assertion({
+				title: 'Updating profile'
+				// the expectFn provides a "server" object that you configure (see below)
+				assertFn: async (server, fromApp) => {
+					// wait for the toast before checking everything else
+					await pass('shows success toast', /* ... */)
+
+					const dbProfile = await server.getProfile(fromApp.userId)
+					pass('has DB updated_at value in the last 10 seconds', /* ... */)
+					pass('has DB values same as form inputs', /* ... */)
+
+					// not all values will match the DB exactly, but these should
+					const fieldsToCompare = [
+						'username', 'uid', 'language', 'avatar_url', 'bio', 'updated_at',
+					]
+					pass('has same values in DB & local collection', () => {
+						for(key in fieldsToCompare) {
+							if (dbProfile[key] !== fromApp.localDbData[key])
+								// failure doesn't end the test; it just records a failure
+								fail(`Values for "${key}" do not match`)
+						}
+					})
+				},
+				appData: () => ({
+					userId,
+					formSuccessData: newProfile,
+					localDbData: store.getProfile(),
+					formInputs: inputs,
+				}),
+			})
+		}
+	})
+	return <form onSubmut={myForm.handleSubmit}>{/* ... */}</form>
+}
+```
+
+You can think of this `assertFn` as analogous to a _Server Action_ in React parlance; we're defining it in our component, with access to its data objects and types, but it's going to be stripped by the bundler and shipped to run on another machine with different context and permissions (in my test suite's NodeJS environment, with elevated permissions for the database and other privileged resources).
+
+This is where we are getting back to the initial concept of `page.evaluate` from Playwright land, except instead of having both the server logic and the browser logic written in the test environment, cloistered away from all the code they're evaluating (and probably treated like a haunted attic by most of your dev team), they live in the component. They produce the `appData` at exactly the spot in the React lifecycle where the form's `onSettled` function is called -- exactly when our mental model of the code tells us it should be ready -- and ships the data to the server as an input to the server-run `assertFn`.
+
+A couple of key things to note here:
+
+1. This assertion will also run when a tester is improving their own test scenes or clicking randomly throughout the app trying to break things. Updated the profile? The test running will evaluate the appData fn, ship it to the test server, and run the assertFn to make sure everything went as planned.
+2. Now that we are fully separating Script flow from Assertion logic, andthing that doesn't break the flow of the script doesn't have to end the test. This is going to get us a lot more useful information on our test runs because if the scene is written correctly enough that we can click around the app like a user would, it just keeps going, logging passes and fails from the in-scope assertions.
+3. As promised: our Client-to-Server testing doesn't have to wire up special infrastructure to access props or state of the React component, and we can access the form's inputs directly, rather than hard-coding them into our spec file as `PROFILE_1_UPDATE_PROFILE_OLD_USERNAME` and `PROFILE_1_UPDATE_PROFILE_NEW_USERNAME`.
+
+### Friendly Little Scripts
+
+Now that we've seen the full store from Client to Server and Start to Finish, we should go back and look at the example scene given above. This is the same code, but focusing only on the `sceneFn`:
+
+```javascript
+// ~tests/scenes/edit-profile.spec.ts
+// .. ignoring imports fttb
+
+scene({
+	// .. ignoring title, prepare, cleanup
 	sceneFn: async (page) => {
-		// .. same login + navigate
-
+		// .. ignoring login / navigate
 		const newUsername = 'Scene Da'
 		form = page.$('main form')
 
 		form.$('input[name=username]').fill(newUsername)
 		await form.submit()
 
-		const newNameOnScreen = form.$(`input[name=username]`).text()
-
-		// we are not testing anything!
-		return {
-			input: newUsername,
-			onscreen: newNameOnScreen,
-		}
-	},
-	reviewFn: ({ input, onscreen }) => {
 		const newNameInDb = await getProfile(actor1.uid)
+		const newNameOnScreen = form.$(`h3#username`).text()
 
-		goal(`Username updated successfully in database`, input === database)
-		goal(`Username updated successfully on screen`, input === onscreen)
-		if (input !== onscreen) {
-			if (input !== database) fail('Username failed to update')
+		// testing only outcomes; no side effects or implementation details
+		pass(`Username updated successfully in database`, newUsername === newNameInDb)
+		pass(`Username updated successfully on screen`, newUsername === newNameOnScreen)
+		if (newUsername !== newNameOnScreen) {
+			if (newUsername !== newNameInDb) fail('Username failed to update')
 			else fail('Username updated in DB but not on screen')
 		}
 	},
 })
 ```
 
-Now that feels nice. The `sceneFn` is only orchestrating user interactions, it's not running
-any checks at all. It's returning some data that gets passed to the `reviewFn`.
+When you first saw this, you might have thought it looks really simple because it's an example. That's partly true, but the main reason it looks really simple is because it actually is much simpler than the orchestration code you would write in other frameworks. Just navigating your app with a test actor can be a technical nightmare, requiring intimate knowledge of your code base and what it all means w/r/t concepts like race conditions, suspense boundaries, network latency, and the React lifecycle. This is nuts, actually!
 
-We've also moved the database query from the scene function to the review function, because
-we're following the mental model of giving a "test script" to a human person who just does
-what's in the script, and we watch and evaluate, and this back-end property of the database
-is not visible to actor1 who we have hired (or simulated) to perform our scene.
+And further, your orchestration code is going to be intermingled with a thousand different decisions you have to make about whether you should include assertions for this side effect or that one -- "did we already test this side effect in a different spec, or is this different enough that we should test it again?" It's dealer's choice with every one of these tiny decisions along the way, leading to a kind of core conceptual inconsistency that keeps you constantly consulting your senior or delaying PRs for discussions about test coverage to resolve.
 
-You may also notice that, now the `sceneFn` doesn't make any attempt to access the database,
-and the `reviewFn` doesn't make any attempt to access the `page`. This is an area for further
-exploration. So far we've been working with the idea of orchestration vs. evaluation, but
-it begs the question, which one does this line belong with:
+Our example above works without these awaits and expect-to-be-visibles, and without skimping on any assertion logic, because the vast majority of the awaiting and expecting has already been handled in the in-scope tests. Now, when our user actor in our scene does `await form.submit()`, we know this triggers network requests, promises, and assertions which also trigger round-trips to the test server and back again, and Scenetest knows to await all of that activity before resolving the promise from `form.submit()` and attempting to proceed. In our case, the `assertion` triggers when the form is settled, after the database and the local collection have been updated. And, crucially, the person in charge of the form component was the one who wrote that in that way; the person who wrote the scene didn't have to know any of it.
 
-```javascript
-const newNameOnScreen = form.$(`input[name=username]`).text()
-```
+## Conclusion
 
-Clearly the script orchestration was over once the form was submitted... and if we decided to
-pass the `page` context to the reviewFn we could always "evaluate" it there... why include it
-in the `sceneFn` at all? Food for further thought.
+### What is Scenetest
 
-Another one for further thought is -- why include the `reviewFn` at all? If the point of the
-scene is to orchestrate user interactions start to finish, and the point of the in-scope tests
-is to test the back-to-front data matching, then perhaps the better answer is to leave out the
-DB check entirely and just let the scene function return a boolean:
+It's just a concept doc right now (the one you're reading).
 
-```javascript
-// ~tests/scenes/profile.spec.ts
-// .. same imports, except no getProfile this time
+### What are Current Steps
 
-test.scene({
-	// ..
-	sceneFn: async (page) => {
-		// .. same login + navigate
+Flesh out the concept, talk to friends.
 
-		const newUsername = 'Scene Da'
-		form = page.$('main form')
+## Missing From This Doc
 
-		form.$('input[name=username]').fill(newUsername)
-		await form.submit()
-
-		return (newUsername === form.$(`input[name=username]`).text())
-	},
-	// no reviewFn needed
-})
-```
-
-Of course, if you wanted to you could still put goals and fails in there to surface additional
-information for reporting, (like in the first example), but the exploratory work for now is to
-figure out the smoothest ergonomics for keeping these concepts separate enough and close enough.
-
-I think the core idea here is that we don't want to be testing side effects or testing our tests,
-and the primary concept we are using for this is to separate the idea of "end-to-end" into two
-axes: back-to-front, and start-to-finish. And this way you don't have to feel like your
-script-writing (start-to-finish) code is hampered by having to insert assertions all over the
-place, because your back-to-front testing is happening every step of the way, without you having
-to say a word.
-
-In this way, we are making parts of our testing process re-usable in exactly the way we already
-re-use react components, functions, hooks, etc. -- by moving the F2B tests into those very same
-functions and having them run whenever the functions run. All of this together should make the
-rigorous parts more rigorous, and the flow-y parts more flow-y. Scripting new "runs" through
-your app shouldn't feel awful; it shouldn't take forever. You should be able to just turn on
-the recorder and click through your app and have it a) record a new start-to-finish scene script,
-(without having to know anything at all about what should be asserted along the way), and b) run
-the front-to-back tests as you go and stream the results to your testing UI.
+1. Actors -- we want to have a formal concept of Actors that make it possible to write one scene where two actors interact with the app. This should allow easier testing of: chat interfaces, friend requests, live editing experiences, and more.
+2. Technical Architecture -- documenting the specific architecture of how everything will work. These are mostly solved problems so I haven't bothered yet. Playwright and Tanstack Start exist, so everything in this doc should be doable with existing / proven approaches.
+3. Possible ease of testing with browser plugin -- plenty of other systems have browser-plugin approaches where you orchestrate user interactions/scripts by clicking things; this approach could be quite powerful here because if the devs write assertions based on the mental model of the feature they're writing, then anyone on the team can make new scripts by recording point-and-click, giving a ton of extra rigor to the ease-of-use that this "record your session" approach provides.
+4. Impact on AI-assisted programming -- it seems quite plausible that this approach will make it easier to use natural language prompts to generate both Scene specs and in-scope Assertions.
+	* Scene specs will be easier to write for all the reasons described in this document: they will be far simpler and more readable.
+	* Assertions will be easier to write because they will be colocated with the feature code, and the LLM can write them in response to the same prompts. For example: a developer might write a prompt that says, "a user needs to [this thing]. build me a form that shows [this data] and lets me do [this action] to create a new [this item]. after submitting the form the user should see [this message], the database should have [this record] and the app's local storage should have [this item], and the hook that provides state to the component should now return [this state]". In this way, a good prompt that explains to the LLM what features to write is already giving all of the information it would need to write in-scope tests at the same time.
